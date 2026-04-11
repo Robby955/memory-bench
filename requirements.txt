@@ -1,0 +1,8 @@
+torch>=2.5.0
+fla-core>=0.4.0
+rustbpe
+tokenizers
+sentencepiece
+matplotlib
+numpy
+scipy

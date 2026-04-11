@@ -1,0 +1,5 @@
+# Persistent Memory Tokens
+# K learnable KV vectors per layer, position-agnostic
+mechanism: persistent
+depth: 12
+num_memory_tokens: 32  # 32 tokens * 12 layers * 2 * 768 = ~590K params

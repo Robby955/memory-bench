@@ -1,0 +1,7 @@
+# Recurrent Memory Transformer
+# Memory tokens carried between segments via BPTT
+mechanism: rmt
+depth: 12
+num_memory_tokens: 16
+segment_length: 512
+bptt_depth: 2  # backprop through 2 segments

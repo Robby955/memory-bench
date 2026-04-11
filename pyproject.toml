@@ -1,0 +1,36 @@
+[project]
+name = "memory-bench"
+version = "0.1.0"
+description = "Controlled comparison of memory mechanisms for small-scale LLMs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Robby Sneiderman"},
+]
+dependencies = [
+    "torch>=2.4.0",
+    "wandb>=0.21.0",
+    "matplotlib>=3.9.0",
+    "pyyaml>=6.0",
+    "numpy>=1.26.0",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "torch>=2.4.0",
+    "fla-core>=0.3.0",
+]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["memory_bench*"]
+
+[build-system]
+requires = ["setuptools>=65.0"]
+build-backend = "setuptools.build_meta"

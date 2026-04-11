@@ -1,0 +1,6 @@
+# Gated DeltaNet
+# Linear attention with delta rule + data-dependent gating
+# Replaces attention at layer n_layer//3
+mechanism: deltanet
+depth: 12
+deltanet_layers: ""  # empty = auto (n_layer // 3)

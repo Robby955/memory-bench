@@ -1,0 +1,3 @@
+# Baseline: standard nanochat GPT, no memory augmentation
+mechanism: none
+depth: 12

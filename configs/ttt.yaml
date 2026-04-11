@@ -1,0 +1,6 @@
+# TTT-Linear (Test-Time Training)
+# Replaces middle layer with gradient-updated linear model
+mechanism: ttt
+depth: 12
+ttt_layer: -1  # -1 = middle layer (n_layer // 2)
+ttt_chunk_size: 64
