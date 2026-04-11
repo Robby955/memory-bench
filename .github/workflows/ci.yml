@@ -35,7 +35,7 @@ jobs:
           python -c "from memory_bench.mechanisms.persistent import PersistentMemory; print('persistent OK')"
           python -c "from memory_bench.bench import aggregate_results; print('bench OK')"
           python -c "from memory_bench.plot import plot_bpb_comparison; print('plot OK')"
-          python -c "from memory_bench.models import build_model_config; print('models OK')"
+          python -c "from memory_bench.models import build_gpt_config; print('models OK')"
 
       - name: Run CPU-compatible tests
         run: |
