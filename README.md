@@ -60,7 +60,7 @@ Plots in `results/figures/`.
 
 **BPB-by-position evaluation.** 32-bucket positional analysis showing where in the context each mechanism helps or hurts.
 
-**154-test suite** covering mechanism wrapping, numerical correctness, optimizer surgery, regression baselines, seed reproducibility, and CLI plumbing.
+**Test suite** covering mechanism wrapping, numerical correctness, optimizer surgery, regression baselines, seed reproducibility, and CLI plumbing.
 
 ### Engineering notes
 
@@ -135,7 +135,7 @@ memory_bench/
 ├── plot.py              Figure generation
 └── models.py            Config builder + param counting
 nanochat/                Git submodule (Karpathy's nanochat)
-tests/                   154 tests across 13 files
+tests/                   Test suite (10 files + conftest)
 run_experiments.sh       Full benchmark orchestration
 ```
 
@@ -166,7 +166,7 @@ Results save to `results/` as JSON. Each JSON includes full training metadata, B
 
 ```bash
 pip install pytest
-pytest tests/ -v   # 154 tests, ~30s
+pytest tests/ -v
 ```
 
 Covers: mechanism wrapping, numerical correctness, optimizer surgery, regression baselines, BPB evaluation, CLI plumbing, seed reproducibility.
