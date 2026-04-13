@@ -415,7 +415,7 @@ class TestBenchAggregation:
         }]
 
         agg = aggregate_results(results)
-        key = "baseline_d12"
+        key = "baseline_d12_t2048"  # key includes context length (defaults to 2048)
         assert key in agg
         assert agg[key]["std_bpb"] == 0  # not None
         assert agg[key]["mean_bpb"] == 1.23456

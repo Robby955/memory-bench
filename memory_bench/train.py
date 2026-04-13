@@ -138,6 +138,12 @@ vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
 # ---------------------------------------------------------------------------
+# Preflight validation
+if args.mechanism == "rmt":
+    assert args.max_seq_len % args.segment_length == 0, \
+        f"--max-seq-len={args.max_seq_len} must be divisible by --segment-length={args.segment_length}"
+
+# ---------------------------------------------------------------------------
 # Build mechanism
 mechanism = None
 if args.mechanism != "none":
@@ -559,9 +565,10 @@ if master_process:
     print0("Running BPB-by-position analysis...")
     model.eval()
     bpb_val_loader = build_val_loader()
+    num_buckets = max(32, args.max_seq_len // 64)
     bpb_by_pos = evaluate_bpb_by_position(
         orig_model if mechanism and mechanism.requires_segments else model,
-        bpb_val_loader, token_bytes, num_steps=50, num_buckets=32,
+        bpb_val_loader, token_bytes, num_steps=50, num_buckets=num_buckets,
     )
     bucket_bpbs = [v["bpb"] for v in bpb_by_pos["buckets"].values()]
     print0(f"BPB by position (first/mid/last bucket): "
@@ -573,7 +580,8 @@ if master_process:
 if master_process:
     os.makedirs("results/checkpoints", exist_ok=True)
     mech_label = args.mechanism if args.mechanism != "none" else "baseline"
-    ckpt_file = f"results/checkpoints/{mech_label}_d{args.depth}_s{args.seed}.pt"
+    wp_tag = f"_w{args.window_pattern}" if args.window_pattern != "SSSL" else ""
+    ckpt_file = f"results/checkpoints/{mech_label}_d{args.depth}_t{args.max_seq_len}{wp_tag}_s{args.seed}.pt"
     ckpt = {"model_state_dict": orig_model.state_dict(), "step": step, "val_bpb": val_bpb}
     if mechanism:
         ckpt["mechanism_params"] = {k: v for k, v in zip(
@@ -609,6 +617,8 @@ if master_process:
     results = {
         "mechanism": mechanism.name if mechanism else "baseline",
         "depth": args.depth,
+        "max_seq_len": args.max_seq_len,
+        "window_pattern": args.window_pattern,
         "seed": args.seed,
         "val_bpb": val_bpb,
         "min_val_bpb": min_val_bpb,
@@ -626,7 +636,8 @@ if master_process:
         results["niah"] = niah_results
     os.makedirs("results", exist_ok=True)
     mech_label = args.mechanism if args.mechanism != "none" else "baseline"
-    result_file = f"results/{mech_label}_d{args.depth}_s{args.seed}.json"
+    wp_tag = f"_w{args.window_pattern}" if args.window_pattern != "SSSL" else ""
+    result_file = f"results/{mech_label}_d{args.depth}_t{args.max_seq_len}{wp_tag}_s{args.seed}.json"
     with open(result_file, "w") as f:
         json.dump(results, f, indent=2)
     print0(f"Results saved to {result_file}")

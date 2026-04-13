@@ -1,0 +1,639 @@
+% Context Deficit Maps — Workshop Paper Draft
+% Compile: pdflatex main && bibtex main && pdflatex main && pdflatex main
+%
+% NOTE: Swap \documentclass to icml2026 or neurips_2026 for submission.
+% This uses a clean article class for drafting.
+
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{natbib}
+\usepackage{microtype}
+\usepackage{caption}
+\usepackage{subcaption}
+
+% Clean paragraph spacing (no indent, vertical gap between paragraphs)
+\usepackage{parskip}
+\setlength{\parskip}{0.6\baselineskip plus 2pt minus 1pt}
+
+% Draft helpers
+\newcommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
+\newcommand{\result}[1]{\textcolor{blue}{\textbf{[RESULT: #1]}}}
+\newcommand{\bpb}{\mathrm{BPB}}
+\newcommand{\deficit}{\mathcal{D}}
+\newcommand{\gain}{\mathcal{G}}
+\newcommand{\closure}{\mathcal{C}}
+
+\title{%
+  When Does Memory Pay Off?\\
+  Diagnosing Positional Context Deficit in Restricted-Attention Transformers%
+}
+\author{Robby Sneiderman}
+\date{Draft --- \today}
+
+\begin{document}
+\maketitle
+
+% =====================================================================
+\begin{abstract}
+% =====================================================================
+We introduce a diagnostic framework for evaluating when explicit memory
+mechanisms justify their overhead in context-restricted transformers.
+Standard evaluation reports a single aggregate perplexity, which averages
+over positions where local attention is already sufficient and positions
+where it is not. We decompose performance by position, defining a
+\emph{positional context deficit} as the per-position gap between a
+local-attention model and a matched global-attention reference. We then
+ask whether persistent memory preferentially closes this deficit as
+sequence length grows. In controlled experiments on a 12-layer GPT
+trained at context lengths 2048, 4096, and 8192, we find that:
+\result{deficit grows / is flat with context},
+\result{memory closes X\% of deficit in high-deficit region},
+and \result{aggregate BPB crosses over at T $\approx$ X / never crosses}.
+The framework is architecture-agnostic and provides a reusable protocol
+for diagnosing whether any memory mechanism is solving the right problem.
+Code and results are available at
+\url{https://github.com/Robby955/memory-bench}.
+\end{abstract}
+
+
+% =====================================================================
+\section{Introduction}
+\label{sec:intro}
+% =====================================================================
+
+Efficient attention patterns---sliding windows, sparse attention,
+mixed local-global stacks---reduce the quadratic cost of full attention
+at the price of restricting each token's direct access to context
+\citep{jiang2023mistral, beltagy2020longformer, zaheer2020bigbird}.
+Memory mechanisms such as persistent memory tokens
+\citep{sukhbaatar2019persistent}, recurrent memory
+\citep{bulatov2022rmt}, and test-time training
+\citep{sun2024ttt} are motivated as a way to compensate: they
+maintain state across positions or segments, potentially recovering
+information that restricted attention cannot reach directly.
+
+But evaluation of these mechanisms typically reports a single aggregate
+metric---perplexity or bits-per-byte (BPB)---over all positions in the
+sequence. Aggregate BPB alone cannot distinguish between three cases:
+(i)~there is no meaningful access problem,
+(ii)~there is an access problem but memory does not repair it, and
+(iii)~there is an access problem and memory repairs it enough to matter.
+\citet{liu2023lost} showed that model performance depends heavily on
+where relevant information sits in the context.
+\citet{fang2025longppl} argued that ordinary perplexity dilutes
+long-context ability by averaging over tokens that are not
+context-sensitive. This study is designed to separate those cases.
+
+We propose a position-resolved evaluation framework built on three
+metrics:
+
+\begin{enumerate}
+\item \textbf{Positional context deficit} $\deficit_T(p)$: the
+  per-position BPB gap between a local-attention model and a matched
+  global-attention reference. This measures the cost of restricting
+  context access at each position.
+
+\item \textbf{Memory gain} $\gain_T(p)$: the per-position BPB
+  improvement from adding a memory mechanism to the local-attention
+  model.
+
+\item \textbf{Deficit closure} $\closure_T(p)$: the fraction of the
+  context deficit recovered by memory. This answers: where the
+  architecture is impaired, does memory repair the impairment?
+\end{enumerate}
+
+The framework separates two questions that aggregate BPB conflates:
+(a)~does memory help \emph{somewhere}, and (b)~does it help
+\emph{where the base architecture is most deficient}? A mechanism
+that provides uniform overhead reduction is less interesting than one
+that preferentially targets the access deficit.
+
+We apply this framework to persistent memory
+\citep{sukhbaatar2019persistent} in a 12-layer GPT with mixed
+local-global attention (SSSL pattern), training at context lengths
+2048, 4096, and 8192 on a fixed token budget. This is a case study;
+the framework itself is architecture-agnostic.
+
+\paragraph{Contributions.}
+\begin{itemize}
+\item A reusable diagnostic protocol---deficit, gain, closure---for
+  evaluating memory mechanisms under restricted-context attention.
+\item Controlled experiments at three context lengths with a matched
+  global-attention reference, including block bootstrap confidence
+  intervals and a difference-in-differences analysis at the attention
+  window boundary.
+\item Targeted synthetic probes that test cross-window information
+  transfer independent of natural-text confounds.
+\item An honest assessment: persistent memory
+  \result{does / does not} close the deficit, and aggregate
+  BPB \result{does / does not} cross over.
+\end{itemize}
+
+
+% =====================================================================
+\section{Framework}
+\label{sec:framework}
+% =====================================================================
+
+\subsection{Setup}
+
+We consider a family of autoregressive language models that share
+architecture (depth, width, optimizer, token budget) and differ only in
+attention pattern and memory mechanism. Let $\bpb_A(p, T)$ denote the
+mean bits-per-byte at position bucket $p$ for model $A$ trained with
+maximum context length $T$.
+
+Three model variants define the framework:
+\begin{itemize}
+\item \textbf{Local}: window pattern SSSL (3/4 of layers use a short
+  window of $\approx T/4$, 1/4 use full context). This is the standard
+  efficient-attention baseline.
+\item \textbf{Global}: window pattern L (all layers use full context).
+  This is an operational reference---the same model with unrestricted
+  access---not an information-theoretic ceiling.
+\item \textbf{Memory}: window pattern SSSL plus a memory mechanism
+  (persistent memory in our case study).
+\end{itemize}
+
+\subsection{Metrics}
+
+\paragraph{Positional context deficit.}
+\begin{equation}
+  \deficit_T(p) = \bpb_{\text{local}}(p, T) - \bpb_{\text{global}}(p, T)
+  \label{eq:deficit}
+\end{equation}
+Positive deficit means local attention underperforms relative to
+unrestricted access at position~$p$. The deficit is an operational proxy,
+not a claim about information sufficiency: global attention is a different
+inductive bias, not a pure upper bound.
+
+\paragraph{Memory gain.}
+\begin{equation}
+  \gain_T(p) = \bpb_{\text{local}}(p, T) - \bpb_{\text{memory}}(p, T)
+  \label{eq:gain}
+\end{equation}
+Positive gain means the memory mechanism improves on the local-attention
+model at position~$p$.
+
+\paragraph{Deficit closure.}
+\begin{equation}
+  \closure_T(p) = \frac{\gain_T(p)}{\max\bigl(\deficit_T(p),\; \epsilon\bigr)}
+  \label{eq:closure}
+\end{equation}
+with $\epsilon = 0.001$~BPB. Closure near 1.0 means memory fully
+recovers the access deficit; near 0.0 means it does not help where
+attention is impaired; greater than 1.0 means it exceeds the
+global-attention reference (overshooting). Closure is undefined
+(masked) where $\deficit_T(p) < \epsilon$, because the local model
+is already sufficient there.
+
+\subsection{Primary Endpoint and Selectivity}
+\label{sec:primary}
+
+The primary endpoint is \textbf{seed-averaged late-region closure
+at $T{=}8192$}, where the late region $R_{\text{late}}$ is the
+final quartile of sequence positions. This is pre-registered: the
+region is fixed by position, not selected post hoc from the data.
+
+\textbf{Regional closure} over a fixed region $R$:
+\begin{equation}
+  \closure(T, R)
+  = \frac{\bar{B}_{\text{local}}(T, R) - \bar{B}_{\text{memory}}(T, R)}
+         {\bar{B}_{\text{local}}(T, R) - \bar{B}_{\text{global}}(T, R)}
+  \label{eq:regional_closure}
+\end{equation}
+where $\bar{B}_m(T, R)$ is the token-weighted average BPB for
+model~$m$ in region~$R$. Closure is only interpreted when the
+denominator is positive (i.e., the local model is worse than the
+global reference in that region).
+
+\textbf{Selectivity} measures whether memory is targeted or
+uniformly shifts BPB:
+\begin{equation}
+  S(T) = \closure(T, R_{\text{late}}) - \closure(T, R_{\text{early}})
+  \label{eq:selectivity}
+\end{equation}
+Positive selectivity means memory helps more in late positions
+(where the deficit is expected to concentrate) than in early
+positions.
+
+\subsection{Hypotheses}
+\label{sec:hypotheses}
+
+\begin{description}
+\item[H1 (late-position deficit):]
+  The positional context deficit is larger in late positions than
+  early positions at each context length.
+
+\item[H2 (deficit grows with context):]
+  The late-position deficit grows with context length:
+  $\bar{\deficit}(R_{\text{late}}, 8192)
+  > \bar{\deficit}(R_{\text{late}}, 4096)
+  > \bar{\deficit}(R_{\text{late}}, 2048)$.
+
+\item[H3 (positive closure):]
+  Persistent memory closes a positive fraction of the late-position
+  deficit: $\closure(8192, R_{\text{late}}) > 0$.
+
+\item[H4 (selective closure):]
+  Closure is selective: $S(T) > 0$ for $T \geq 4096$. Memory helps
+  more in the deficit-heavy late region than in the early region.
+
+\item[H5 (synthetic probe confirmation):]
+  On targeted probes, the memory advantage appears primarily when
+  the dependency distance exceeds the SSSL window ($T/4$).
+\end{description}
+
+\paragraph{Interpretation of outcomes.}
+If H1 and H2 fail, local attention is already sufficient in this
+regime. That is a useful negative result: it means the architecture
+is not context-starved.
+If H1 and H2 hold but H3 fails, the deficit is real but persistent
+memory is not the right repair.
+If H3 holds but aggregate BPB still loses, persistent memory solves
+the right problem but too expensively.
+If H3 holds and aggregate BPB improves, that is the strongest outcome.
+
+
+% =====================================================================
+\section{Experimental Design}
+\label{sec:design}
+% =====================================================================
+
+\subsection{Architecture}
+
+All models use a 12-layer GPT (nanochat codebase) with rotary position
+embeddings (RoPE, $\theta = 100{,}000$), trained with Muon~+~AdamW
+on FineWeb-Edu. The total token budget is fixed at 524,288 tokens per
+batch across all context lengths.
+
+\paragraph{Attention patterns.}
+The SSSL pattern assigns 3/4 of layers a short window of
+$\lceil T/4 / 128 \rceil \times 128$ tokens (aligned to FlashAttention-3
+tile size) and 1/4 of layers the full context. Pattern~L gives all layers
+the full context. Both patterns are set via a single configuration flag;
+no architectural changes are needed.
+
+\paragraph{Persistent memory.}
+Following \citet{sukhbaatar2019persistent}, we prepend $K$ learnable
+memory tokens to the key-value cache of designated attention layers.
+These tokens attend to and are attended by all positions, providing a
+fixed-capacity persistent store accessible from any position in the
+sequence. The mechanism adds $K \times d_{\text{model}}$ parameters
+per layer.
+
+\subsection{Run Matrix}
+
+\begin{table}[h]
+\centering
+\caption{Experiment matrix. Each cell is one training run. We reuse
+existing 2048 results (4 seeds) and run new experiments at 4096 and
+8192 (3 seeds each). Total new runs: 21.}
+\label{tab:matrix}
+\begin{tabular}{llccl}
+\toprule
+Context & Model & Window & Seeds & Status \\
+\midrule
+2048 & Local baseline & SSSL & 4 & Done (v1) \\
+2048 & Global reference & L & 3 & New \\
+2048 & Persistent memory & SSSL & 4 & Done (v1) \\
+\midrule
+4096 & Local baseline & SSSL & 3 & New \\
+4096 & Global reference & L & 3 & New \\
+4096 & Persistent memory & SSSL & 3 & New \\
+\midrule
+8192 & Local baseline & SSSL & 3 & New \\
+8192 & Global reference & L & 3 & New \\
+8192 & Persistent memory & SSSL & 3 & New \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Controls and Admitted Confounds}
+
+Architecture, optimizer, hyperparameters, and total token budget are
+held constant. Context length is the primary independent variable;
+window pattern (SSSL vs L) and mechanism (none vs persistent) are
+secondary.
+
+\textbf{Admitted confounds.} Varying context length also changes:
+number of optimization steps (same token budget, larger sequences =
+fewer steps), gradient noise profile, data packing statistics, and
+the absolute SSSL window size ($T/4$ at $T{=}8192$ is 2048 tokens
+vs 512 at $T{=}2048$). These are documented as limitations, not
+controlled away.
+
+
+% =====================================================================
+\section{Statistical Analysis}
+\label{sec:statistics}
+% =====================================================================
+
+Adjacent position buckets share overlapping context and underlying
+text continuity. Naive significance tests on bucketed BPB overstate
+significance. We handle autocorrelation with three complementary
+methods and report all three.
+
+\paragraph{Block bootstrap (primary).}
+We resample contiguous blocks of position buckets, preserving
+local autocorrelation structure. Block size is chosen as the
+smallest lag~$k$ where the autocorrelation function of the deficit
+series drops below 0.05, with a floor of 3 and cap at $N/4$
+\citep[following][]{metaasr}. We report 95\% percentile
+confidence intervals from 5,000 bootstrap samples for mean
+deficit, gain, and closure.
+
+\paragraph{Newey-West HAC standard errors.}
+When testing whether deficit varies with position via OLS, we use
+Newey-West heteroskedasticity and autocorrelation consistent (HAC)
+standard errors \citep{newey1987hac} with a Bartlett kernel and
+automatic lag selection ($\lfloor N^{1/3} \rfloor$).
+
+\paragraph{Effective degrees of freedom.}
+As a simple check, we compute effective sample size using the
+\citet{bretherton1999effective} formula:
+$N_{\text{eff}} = N \cdot (1 - r_1) / (1 + r_1)$, where $r_1$
+is the lag-1 autocorrelation.
+
+\paragraph{Difference-in-differences at the window boundary.}
+We partition position buckets into Near ($p < T/4$, within the
+SSSL short window for all layers) and Far ($p \geq T/4$, beyond
+the short-window boundary). The DID estimator is:
+\begin{equation}
+  \text{DID} = \bigl[\bpb_{\text{mem}}(\text{far}) - \bpb_{\text{local}}(\text{far})\bigr]
+             - \bigl[\bpb_{\text{mem}}(\text{near}) - \bpb_{\text{local}}(\text{near})\bigr]
+  \label{eq:did}
+\end{equation}
+If memory specifically helps beyond the window boundary,
+$\text{DID} < 0$. The parallel trends assumption is testable:
+we check that local and memory models have similar
+position-dependent BPB trends in the Near region.
+
+
+% =====================================================================
+\section{Results}
+\label{sec:results}
+% =====================================================================
+
+\subsection{Deficit Maps}
+
+\result{Figure~\ref{fig:deficit_map}: three panels showing
+local vs global BPB by position at each context length, with
+shaded deficit region and T/4 boundary marked. Expected: deficit
+grows in late positions as T increases.}
+
+\begin{figure}[h]
+\centering
+% \includegraphics[width=\textwidth]{figures/fig_deficit_map.png}
+\fbox{\parbox{0.95\textwidth}{\centering\vspace{2cm}
+  \textbf{Figure placeholder: Deficit maps at T=2048, 4096, 8192}\\
+  Local (SSSL) vs Global (L) BPB by position, shaded deficit region.
+\vspace{2cm}}}
+\caption{Positional context deficit at three context lengths.
+  \textit{Blue}: local-attention baseline (SSSL).
+  \textit{Green}: global-attention reference (L).
+  \textit{Red shading}: context deficit (local $-$ global).
+  Dashed line: SSSL window boundary at $T/4$.
+  \result{Describe what we observe.}}
+\label{fig:deficit_map}
+\end{figure}
+
+\subsection{Deficit Closure}
+
+\result{Figure~\ref{fig:closure}: deficit and gain curves with
+closure in bottom panels. Table~\ref{tab:closure}: primary
+endpoint values.}
+
+\begin{table}[h]
+\centering
+\caption{Primary endpoint: mean deficit closure in the late region
+(final quartile of sequence positions), with 95\% block bootstrap
+confidence intervals.}
+\label{tab:closure}
+\begin{tabular}{lccc}
+\toprule
+Context & Late Deficit & $\closure(T, R_{\text{late}})$ & 95\% CI \\
+\midrule
+2048 & \result{X.XXXXX} & \result{X.XXX} & \result{[X.XX, X.XX]} \\
+4096 & \result{X.XXXXX} & \result{X.XXX} & \result{[X.XX, X.XX]} \\
+8192 & \result{X.XXXXX} & \result{X.XXX} & \result{[X.XX, X.XX]} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[h]
+\centering
+\fbox{\parbox{0.95\textwidth}{\centering\vspace{2cm}
+  \textbf{Figure placeholder: Deficit closure panels}\\
+  Top row: deficit (red) and gain (green) curves.
+  Bottom row: closure curve with mean annotation.
+\vspace{2cm}}}
+\caption{Deficit closure for persistent memory at three context lengths.
+  \textit{Top}: per-position deficit and gain.
+  \textit{Bottom}: closure (gain / deficit). Dashed line at
+  $\closure = 1.0$ (full closure).
+  \result{Describe trend.}}
+\label{fig:closure}
+\end{figure}
+
+\subsection{Difference-in-Differences}
+
+\begin{table}[h]
+\centering
+\caption{Difference-in-differences at the SSSL window boundary ($T/4$).
+Negative DID indicates memory helps more beyond the boundary.}
+\label{tab:did}
+\begin{tabular}{lcccc}
+\toprule
+Context & Near Effect & Far Effect & DID & Parallel Trends \\
+\midrule
+2048 & \result{$\pm$X.XXXXX} & \result{$\pm$X.XXXXX} & \result{$\pm$X.XXXXX} & \result{yes/no} \\
+4096 & \result{$\pm$X.XXXXX} & \result{$\pm$X.XXXXX} & \result{$\pm$X.XXXXX} & \result{yes/no} \\
+8192 & \result{$\pm$X.XXXXX} & \result{$\pm$X.XXXXX} & \result{$\pm$X.XXXXX} & \result{yes/no} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Synthetic Probes}
+
+We verify that the natural-text deficit arises from cross-window
+information access by testing three controlled probes:
+
+\begin{enumerate}
+\item \textbf{Token recall at distance}: A novel numeric association
+  (``Item alpha-\{id\} costs \{value\}'') is planted at the sequence
+  start, followed by natural-text filler, then queried at varying
+  distances. We measure prediction loss on the value tokens, sweeping
+  distance across the $T/4$ window boundary.
+
+\item \textbf{Entity tracking}: Same structure with entity-attribute
+  bindings (``\{Name\} works at \{Org\}''), using fictional entities
+  to prevent training-data memorization.
+
+\item \textbf{Cross-boundary associative recall}: Multiple key-value
+  pairs are planted in the first $T/4$ of the sequence and queried
+  in the second half, testing multi-item recall capacity across the
+  window boundary.
+\end{enumerate}
+
+\result{Figure or table showing probe loss by distance.
+Expected: memory models show lower loss at distances $> T/4$,
+confirming cross-window information transfer.}
+
+\subsection{Aggregate BPB}
+
+For completeness, we report overall BPB:
+
+\begin{table}[h]
+\centering
+\caption{Aggregate BPB (mean $\pm$ std across seeds).
+  Persistent memory \result{does/does not} achieve lower aggregate
+  BPB than baseline at context $\geq$ \result{X}.}
+\label{tab:aggregate}
+\begin{tabular}{lccc}
+\toprule
+Context & Local (SSSL) & Global (L) & Persistent Memory \\
+\midrule
+2048 & $0.8459 \pm 0.0006$ & \result{X.XXXX $\pm$ X.XXXX} & $0.8442 \pm 0.0005$ \\
+4096 & \result{X.XXXX} & \result{X.XXXX} & \result{X.XXXX} \\
+8192 & \result{X.XXXX} & \result{X.XXXX} & \result{X.XXXX} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Interpretation.}
+The aggregate metric is reported for calibration but is not the
+primary evidence. As \citet{fang2025longppl} argue, aggregate
+perplexity can hide long-context ability by averaging over tokens
+that are not context-sensitive. The deficit and closure metrics
+provide a sharper diagnostic.
+
+
+% =====================================================================
+\section{Related Work}
+\label{sec:related}
+% =====================================================================
+
+\paragraph{Position-dependent evaluation.}
+\citet{liu2023lost} established that LLM performance varies with the
+position of relevant information, finding a U-shaped accuracy curve
+across context. \citet{kamradt2024niah} introduced needle-in-a-haystack
+position $\times$ context heatmaps using synthetic probes.
+\citet{liu2024forgetting} measured position-resolved memorization
+accuracy, showing qualitatively different forgetting curves for
+Transformers and SSMs. \citet{fang2025longppl} decomposed perplexity by
+token type (context-sensitive vs not), arguing that standard perplexity
+hides long-context ability. Our work decomposes by \emph{position} and
+introduces the deficit/closure framework, which is complementary to
+LongPPL's token-type decomposition.
+
+\paragraph{Theoretical grounding.}
+\citet{xiao2025sliding} showed that effective influence in stacked
+sliding windows decays exponentially with the number of hops, not
+linearly, making the theoretical receptive field vastly larger than the
+empirical one. \citet{chowdhury2026lost} demonstrated that the U-shaped
+position bias exists at initialization before training, arising from
+causal masking and residual connections. \citet{wu2025position} and
+\citet{herasimchyk2026residual} provide formal proofs of U-shaped
+attention concentration at finite depth due to residual connection
+barriers. These results provide the theoretical mechanism behind the
+positional deficit we measure.
+
+\paragraph{Memory mechanisms.}
+Persistent memory \citep{sukhbaatar2019persistent} prepends learnable
+tokens to the key-value cache, providing cross-position information
+transfer at fixed parameter cost. Recurrent Memory Transformer
+\citep{bulatov2022rmt} processes segments sequentially with read/write
+memory operations. Test-time training \citep{sun2024ttt} updates model
+parameters at inference. Gated DeltaNet \citep{yang2025gated} replaces
+attention with a linear recurrence. These mechanisms are all motivated
+as compensating for limited context access; our framework provides a
+controlled way to test that motivation.
+
+\paragraph{Restricted-context attention.}
+Mistral~7B \citep{jiang2023mistral} uses a sliding window of 4096
+tokens. Longformer \citep{beltagy2020longformer} combines local
+windowed attention with task-specific global tokens.
+BigBird \citep{zaheer2020bigbird} uses a mix of random, window,
+and global attention. Our SSSL pattern (from the nanochat codebase)
+assigns most layers a short window and a minority the full context,
+similar in spirit to these production architectures.
+
+
+% =====================================================================
+\section{Discussion}
+\label{sec:discussion}
+% =====================================================================
+
+\paragraph{What we showed.}
+\result{1--2 sentences summarizing the main finding.
+Expected: restricted attention creates a measurable positional
+deficit that grows with context, and persistent memory
+closes / does not close a meaningful fraction of it.}
+
+\paragraph{What we did not show.}
+We did not prove that memory is necessary for long context in general.
+The global-attention reference is an operational proxy, not an
+information-theoretic ceiling. Correlation between deficit and gain
+does not establish causation; the synthetic probes provide controlled
+evidence but not proof. The results are specific to one architecture
+family, one training regime, and one memory mechanism.
+
+\paragraph{Limitations.}
+\begin{itemize}
+\item \textbf{Scale.} All models are 12-layer ($\sim$50M parameters).
+  Results may not transfer to larger scales where attention patterns
+  and information routing differ qualitatively.
+\item \textbf{Confounds.} Varying context length changes step count,
+  gradient noise, and data packing. These are documented but not
+  controlled.
+\item \textbf{Single mechanism.} We study persistent memory only.
+  Other mechanisms (RMT, TTT, DeltaNet) may show different
+  closure profiles.
+\item \textbf{Token averaging.} Our bucketed BPB averages over all
+  tokens in each position bucket, including tokens that may not be
+  context-sensitive \citep{fang2025longppl}. A key-token analysis
+  would sharpen the signal.
+\end{itemize}
+
+\paragraph{Broader applicability.}
+The deficit/closure framework is not specific to persistent memory or
+the SSSL attention pattern. Any architecture with restricted context
+access can be evaluated against a matched unrestricted reference.
+Builders of sparse-attention models, hierarchical memory systems, or
+retrieval-augmented context compressors can reuse this protocol to
+diagnose whether their mechanism is solving an access deficit or
+adding overhead to positions that are already sufficient.
+
+
+% =====================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+% =====================================================================
+
+We introduced positional context deficit maps as a diagnostic for
+context-restricted transformers and applied them to evaluate persistent
+memory at three context lengths. The framework separates two questions
+that aggregate BPB conflates: whether memory helps somewhere, and
+whether it helps where the base architecture is most deficient.
+\result{One sentence with the headline result.}
+The protocol is reusable, reproducible, and informative even under
+null results: a small deficit means the architecture is not
+context-starved; zero closure means memory is not the right
+intervention; high closure means memory is paying for itself.
+Code and all results are available at
+\url{https://github.com/Robby955/memory-bench}.
+
+
+% =====================================================================
+% References
+% =====================================================================
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

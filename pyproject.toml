@@ -9,17 +9,18 @@ authors = [
     {name = "Robby Sneiderman"},
 ]
 dependencies = [
-    "torch>=2.4.0",
+    "torch==2.9.1",
     "wandb>=0.21.0",
     "matplotlib>=3.9.0",
     "pyyaml>=6.0",
     "numpy>=1.26.0",
+    "scipy>=1.12.0",
 ]
 
 [project.optional-dependencies]
 gpu = [
-    "torch>=2.4.0",
-    "fla-core>=0.3.0",
+    "torch==2.9.1",
+    "fla-core==0.4.2",
 ]
 dev = [
     "pytest>=8.0.0",

@@ -222,7 +222,7 @@ def plot_parameter_breakdown(results: list[dict], output_path: str):
     print(f"Saved: {output_path}")
 
 
-def plot_bpb_by_position(results: list[dict], output_path: str, depth: int = None):
+def plot_bpb_by_position(results: list[dict], output_path: str, depth: int = None, context_length: int = None):
     """THE centerpiece figure: BPB vs context position for all mechanisms.
 
     Shows mean BPB curve with shaded std bands (across seeds) for each mechanism.
@@ -231,6 +231,9 @@ def plot_bpb_by_position(results: list[dict], output_path: str, depth: int = Non
     groups = _group_by_mechanism(results)
     if depth:
         groups = {k: [r for r in v if r.get("depth") == depth] for k, v in groups.items()}
+        groups = {k: v for k, v in groups.items() if v}
+    if context_length:
+        groups = {k: [r for r in v if r.get("max_seq_len", 2048) == context_length] for k, v in groups.items()}
         groups = {k: v for k, v in groups.items() if v}
 
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -271,7 +274,8 @@ def plot_bpb_by_position(results: list[dict], output_path: str, depth: int = Non
 
     ax.set_xlabel("Position in context (tokens)", fontsize=12)
     ax.set_ylabel("BPB (bits per byte)", fontsize=12)
-    ax.set_title(f"BPB by Context Position - d{depth or 'all'}", fontsize=14)
+    ctx_tag = f" T={context_length}" if context_length else ""
+    ax.set_title(f"BPB by Context Position - d{depth or 'all'}{ctx_tag}", fontsize=14)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
 
@@ -281,7 +285,7 @@ def plot_bpb_by_position(results: list[dict], output_path: str, depth: int = Non
     print(f"Saved: {output_path}")
 
 
-def plot_bpb_position_delta(results: list[dict], output_path: str, depth: int = None):
+def plot_bpb_position_delta(results: list[dict], output_path: str, depth: int = None, context_length: int = None):
     """Delta plot: (mechanism BPB - baseline BPB) at each position bucket.
 
     Negative values = mechanism is better. Shows WHERE each mechanism helps.
@@ -289,6 +293,9 @@ def plot_bpb_position_delta(results: list[dict], output_path: str, depth: int = 
     groups = _group_by_mechanism(results)
     if depth:
         groups = {k: [r for r in v if r.get("depth") == depth] for k, v in groups.items()}
+        groups = {k: v for k, v in groups.items() if v}
+    if context_length:
+        groups = {k: [r for r in v if r.get("max_seq_len", 2048) == context_length] for k, v in groups.items()}
         groups = {k: v for k, v in groups.items() if v}
 
     # Get baseline mean curve
@@ -340,7 +347,8 @@ def plot_bpb_position_delta(results: list[dict], output_path: str, depth: int = 
 
     ax.set_xlabel("Position in context (tokens)", fontsize=12)
     ax.set_ylabel("ΔBPB vs baseline (negative = better)", fontsize=12)
-    ax.set_title(f"Memory Mechanism Improvement by Position - d{depth or 'all'}", fontsize=14)
+    ctx_tag = f" T={context_length}" if context_length else ""
+    ax.set_title(f"Memory Mechanism Improvement by Position - d{depth or 'all'}{ctx_tag}", fontsize=14)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
 
@@ -354,14 +362,28 @@ def generate_all_plots(results: list[dict], output_dir: str = "results/figures")
     """Generate all standard comparison plots."""
     os.makedirs(output_dir, exist_ok=True)
 
-    # Get unique depths
+    # Get unique depths and context lengths
     depths = sorted(set(r.get("depth", 12) for r in results))
+    context_lengths = sorted(set(r.get("max_seq_len", 2048) for r in results))
+    multi_context = len(context_lengths) > 1
 
     for depth in depths:
         depth_results = [r for r in results if r.get("depth") == depth]
-        plot_bpb_comparison(depth_results, os.path.join(output_dir, f"bpb_d{depth}.png"), depth=depth)
-        plot_bpb_by_position(depth_results, os.path.join(output_dir, f"bpb_by_position_d{depth}.png"), depth=depth)
-        plot_bpb_position_delta(depth_results, os.path.join(output_dir, f"bpb_position_delta_d{depth}.png"), depth=depth)
+
+        if multi_context:
+            # Per-context plots
+            for ctx in context_lengths:
+                ctx_results = [r for r in depth_results if r.get("max_seq_len", 2048) == ctx]
+                if not ctx_results:
+                    continue
+                plot_bpb_comparison(ctx_results, os.path.join(output_dir, f"bpb_d{depth}_t{ctx}.png"), depth=depth)
+                plot_bpb_by_position(ctx_results, os.path.join(output_dir, f"bpb_by_position_d{depth}_t{ctx}.png"), depth=depth, context_length=ctx)
+                plot_bpb_position_delta(ctx_results, os.path.join(output_dir, f"bpb_position_delta_d{depth}_t{ctx}.png"), depth=depth, context_length=ctx)
+        else:
+            # Single-context (backward compat)
+            plot_bpb_comparison(depth_results, os.path.join(output_dir, f"bpb_d{depth}.png"), depth=depth)
+            plot_bpb_by_position(depth_results, os.path.join(output_dir, f"bpb_by_position_d{depth}.png"), depth=depth)
+            plot_bpb_position_delta(depth_results, os.path.join(output_dir, f"bpb_position_delta_d{depth}.png"), depth=depth)
 
     plot_efficiency_pareto(results, os.path.join(output_dir, "pareto.png"))
     plot_parameter_breakdown(results, os.path.join(output_dir, "params.png"))
@@ -371,7 +393,8 @@ def generate_all_plots(results: list[dict], output_dir: str = "results/figures")
         if "niah" in r and r["niah"]:
             mech = r.get("mechanism", "baseline")
             seed = r.get("seed", 0)
+            ctx = r.get("max_seq_len", 2048)
             plot_niah_heatmap(
                 r["niah"], mech,
-                os.path.join(output_dir, f"niah_{mech}_s{seed}.png"),
+                os.path.join(output_dir, f"niah_{mech}_t{ctx}_s{seed}.png"),
             )

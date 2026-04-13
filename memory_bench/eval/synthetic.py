@@ -525,3 +525,387 @@ def evaluate_bpb_by_position(
         "buckets": buckets,
         "overall_mean_bpb": float(np.mean(mean_bpb)),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cross-Window Probes (Direction B: Positional Context Deficit)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Loss-based probes for testing whether memory mechanisms enable information
+# transfer beyond the SSSL window boundary (T/4). Unlike the generation-based
+# probes above, these measure prediction loss at specific positions, producing
+# continuous metrics compatible with the deficit/closure framework.
+#
+# Design principles:
+# - Plant novel (random) associations that cannot be predicted from training
+# - Fill remaining context with natural-looking procedural filler text
+# - Measure cross-entropy loss in bits at positions where the answer appears
+# - Report per-distance loss for comparison across models
+#
+# Reference: docs/research_design.md Section 5 (Synthetic Probes)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Semantically neutral filler sentences for padding between fact and query.
+_FILLER_SENTENCES = [
+    "The development of new methods remains an active area of research.",
+    "Several factors contribute to the overall performance of the system.",
+    "This approach has been widely adopted in various applications.",
+    "Further analysis is needed to understand the underlying mechanisms.",
+    "The results demonstrate the effectiveness of the proposed technique.",
+    "Previous work has established several important baselines.",
+    "The implementation follows standard best practices for reliability.",
+    "Additional experiments were conducted to validate the findings.",
+    "The framework provides a flexible foundation for future extensions.",
+    "These observations are consistent with theoretical predictions.",
+    "Recent advances have significantly improved the state of the art.",
+    "The methodology was designed to minimize confounding variables.",
+    "Data collection followed established protocols for consistency.",
+    "Quality assurance measures were applied throughout the process.",
+    "Computational resources were allocated based on task requirements.",
+    "The evaluation protocol includes multiple independent measurements.",
+]
+
+# Fictional names and organizations (prevents training-data memorization)
+_ENTITY_NAMES = [
+    "Kelvin", "Mateo", "Priya", "Linnea", "Tariq", "Saoirse", "Dmitri",
+    "Yuki", "Amara", "Caspian", "Zuri", "Elowen", "Ravi", "Freya",
+    "Idris", "Nadia", "Orion", "Callista", "Boden", "Liora",
+]
+
+_FICTIONAL_ORGS = [
+    "Nexora", "Veltrix", "Quorin", "Zephyral", "Pyndex", "Calthor",
+    "Brionix", "Stelvara", "Kovanti", "Meridex", "Falcuri", "Synthos",
+    "Dravion", "Elluvian", "Kromet", "Vaelith", "Tyndall", "Orvisan",
+]
+
+
+def _make_filler_tokens(
+    tokenizer, target_length: int, rng: random.Random,
+) -> list[int]:
+    """Generate filler text of exactly target_length tokens."""
+    if target_length <= 0:
+        return []
+    text = ""
+    tokens: list[int] = []
+    while len(tokens) < target_length:
+        text += " " + rng.choice(_FILLER_SENTENCES)
+        tokens = tokenizer.encode(text)
+    return tokens[:target_length]
+
+
+def _compute_loss_at_positions(
+    model,
+    sequence: list[int],
+    target_positions: list[int],
+    device: torch.device,
+) -> list[float]:
+    """Compute cross-entropy loss in bits at specific sequence positions.
+
+    Args:
+        model: GPT model returning (B, T, V) logits
+        sequence: token IDs of length T
+        target_positions: positions in sequence where we measure loss.
+            Position p means: loss of predicting sequence[p] given
+            context sequence[0:p].
+        device: torch device
+
+    Returns:
+        Per-position losses in bits (nats / log(2))
+    """
+    T = len(sequence)
+    x = torch.tensor([sequence[:-1]], device=device)
+    logits = model(x)
+    log_probs = F.log_softmax(logits.float(), dim=-1)
+
+    losses = []
+    for pos in target_positions:
+        if pos < 1 or pos >= T:
+            continue
+        nll = -log_probs[0, pos - 1, sequence[pos]].item()
+        losses.append(nll / math.log(2))
+    return losses
+
+
+def _default_distances(max_seq_len: int) -> list[int]:
+    """Distance sweep points: 3 within SSSL window, 1 at boundary, 3 beyond."""
+    T = max_seq_len
+    boundary = T // 4
+    candidates = sorted(set([
+        max(64, T // 16),
+        max(128, T // 8),
+        max(192, 3 * T // 16),
+        boundary,
+        min(3 * T // 8, T - 64),
+        min(T // 2, T - 64),
+        min(3 * T // 4, T - 64),
+    ]))
+    return [d for d in candidates if 50 < d < T - 50]
+
+
+@torch.no_grad()
+def evaluate_token_recall_at_distance(
+    model,
+    tokenizer,
+    _token_bytes: Optional[torch.Tensor] = None,
+    max_seq_len: int = 2048,
+    distances: Optional[list[int]] = None,
+    num_trials: int = 100,
+    seed: int = 42,
+) -> dict:
+    """Probe 1: Token recall at varying distances from a planted fact.
+
+    Plants "Item alpha-{id} costs {value}." near the sequence start, adds
+    natural-text filler, then presents "Item alpha-{id} costs" at distance D.
+    Measures prediction loss on the value tokens.
+
+    The association is random and cannot be predicted from training. Lower
+    loss = better recall. Memory mechanisms should show lower loss than
+    local attention at distances beyond T/4 (the SSSL window boundary).
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    rng = random.Random(seed)
+
+    if distances is None:
+        distances = _default_distances(max_seq_len)
+
+    window_boundary = max_seq_len // 4
+    results_by_distance = {}
+
+    for distance in distances:
+        trial_losses = []
+
+        for _ in range(num_trials):
+            item_id = rng.randint(100, 999)
+            value = rng.randint(1000, 9999)
+
+            fact_tokens = tokenizer.encode(f" Item alpha-{item_id} costs {value}.")
+            query_tokens = tokenizer.encode(f" Item alpha-{item_id} costs")
+            value_tokens = tokenizer.encode(f" {value}")
+
+            bos = tokenizer.get_bos_token_id()
+
+            filler_len = distance - len(fact_tokens)
+            if filler_len < 0:
+                continue
+            filler = _make_filler_tokens(tokenizer, filler_len, rng)
+
+            prefix = [bos] + fact_tokens + filler + query_tokens
+            value_start = len(prefix)
+            core = prefix + value_tokens
+
+            remaining = max_seq_len - len(core)
+            if remaining < 0:
+                continue
+            tail = _make_filler_tokens(tokenizer, remaining, rng) if remaining > 0 else []
+            sequence = core + tail
+
+            positions = list(range(value_start, value_start + len(value_tokens)))
+            losses = _compute_loss_at_positions(model, sequence, positions, device)
+            if losses:
+                trial_losses.append(float(np.mean(losses)))
+
+        if trial_losses:
+            results_by_distance[distance] = {
+                "mean_loss_bits": float(np.mean(trial_losses)),
+                "std_loss_bits": float(np.std(trial_losses)),
+                "n_valid": len(trial_losses),
+            }
+
+    return {
+        "task": "token_recall_at_distance",
+        "max_seq_len": max_seq_len,
+        "window_boundary": window_boundary,
+        "distances": distances,
+        "results_by_distance": {str(k): v for k, v in results_by_distance.items()},
+    }
+
+
+@torch.no_grad()
+def evaluate_entity_tracking(
+    model,
+    tokenizer,
+    _token_bytes: Optional[torch.Tensor] = None,
+    max_seq_len: int = 2048,
+    distances: Optional[list[int]] = None,
+    num_trials: int = 100,
+    seed: int = 42,
+) -> dict:
+    """Probe 2: Entity-attribute tracking at varying distances.
+
+    Plants "{Name} works at {Org}." near the sequence start, fills with
+    natural text, then presents "{Name} works at" at distance D. Measures
+    prediction loss on the organization name tokens.
+
+    Uses fictional names and organizations to prevent memorization from
+    training data. Lower loss = better entity tracking across distance.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    rng = random.Random(seed)
+
+    if distances is None:
+        distances = _default_distances(max_seq_len)
+
+    window_boundary = max_seq_len // 4
+    results_by_distance = {}
+
+    for distance in distances:
+        trial_losses = []
+
+        for _ in range(num_trials):
+            name = rng.choice(_ENTITY_NAMES)
+            org = rng.choice(_FICTIONAL_ORGS)
+
+            fact_tokens = tokenizer.encode(f" {name} works at {org}.")
+            query_tokens = tokenizer.encode(f" {name} works at")
+            value_tokens = tokenizer.encode(f" {org}")
+
+            bos = tokenizer.get_bos_token_id()
+
+            filler_len = distance - len(fact_tokens)
+            if filler_len < 0:
+                continue
+            filler = _make_filler_tokens(tokenizer, filler_len, rng)
+
+            prefix = [bos] + fact_tokens + filler + query_tokens
+            value_start = len(prefix)
+            core = prefix + value_tokens
+
+            remaining = max_seq_len - len(core)
+            if remaining < 0:
+                continue
+            tail = _make_filler_tokens(tokenizer, remaining, rng) if remaining > 0 else []
+            sequence = core + tail
+
+            positions = list(range(value_start, value_start + len(value_tokens)))
+            losses = _compute_loss_at_positions(model, sequence, positions, device)
+            if losses:
+                trial_losses.append(float(np.mean(losses)))
+
+        if trial_losses:
+            results_by_distance[distance] = {
+                "mean_loss_bits": float(np.mean(trial_losses)),
+                "std_loss_bits": float(np.std(trial_losses)),
+                "n_valid": len(trial_losses),
+            }
+
+    return {
+        "task": "entity_tracking",
+        "max_seq_len": max_seq_len,
+        "window_boundary": window_boundary,
+        "distances": distances,
+        "results_by_distance": {str(k): v for k, v in results_by_distance.items()},
+    }
+
+
+@torch.no_grad()
+def evaluate_cross_boundary_ar(
+    model,
+    tokenizer,
+    _token_bytes: Optional[torch.Tensor] = None,
+    max_seq_len: int = 2048,
+    num_pairs: int = 8,
+    num_trials: int = 100,
+    seed: int = 42,
+) -> dict:
+    """Probe 3: Cross-boundary associative recall with multiple KV pairs.
+
+    Plants N key-value associations in the first T/4 of the sequence, fills
+    the middle with natural text, then queries each key in the second half.
+    Measures prediction loss on value tokens.
+
+    Unlike Probes 1-2 (single fact, sweep distance), this tests multi-item
+    recall across the window boundary simultaneously — probing memory
+    capacity, not just reach.
+
+    Results are reported per pair (pair 0 planted first = farthest from
+    its query, pair N-1 planted last = closest to its query).
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    rng = random.Random(seed)
+
+    window_boundary = max_seq_len // 4
+
+    # Accumulate losses per pair, keyed by actual distance
+    pair_trial_losses = defaultdict(list)   # pair_idx -> [trial losses]
+    pair_distances = defaultdict(list)      # pair_idx -> [distances]
+
+    for _ in range(num_trials):
+        pairs = []
+        for _ in range(num_pairs):
+            key_id = rng.randint(100, 999)
+            value = rng.randint(1000, 9999)
+            pairs.append((key_id, value))
+
+        bos = tokenizer.get_bos_token_id()
+
+        # Build KV section: placed sequentially from start
+        kv_section = [bos]
+        kv_end_positions = []  # end position of each KV pair's value
+        for key_id, value in pairs:
+            kv_text = f" Key-{key_id} maps to {value}."
+            kv_tokens = tokenizer.encode(kv_text)
+            kv_end_positions.append(len(kv_section) + len(kv_tokens))
+            kv_section.extend(kv_tokens)
+
+        # Filler: from end of KV section to ~T/2
+        filler_target = max(0, max_seq_len // 2 - len(kv_section))
+        filler = _make_filler_tokens(tokenizer, filler_target, rng)
+        current = kv_section + filler
+
+        # Build queries in order (pair 0 first)
+        value_map = []  # (value_start, value_end, pair_idx, kv_end_pos)
+        for idx, (key_id, value) in enumerate(pairs):
+            q_tokens = tokenizer.encode(f" Key-{key_id} maps to")
+            v_tokens = tokenizer.encode(f" {value}")
+
+            value_start = len(current) + len(q_tokens)
+            value_end = value_start + len(v_tokens)
+
+            if value_end > max_seq_len:
+                break
+            current = current + q_tokens + v_tokens
+            value_map.append((value_start, value_end, idx, kv_end_positions[idx]))
+
+        # Pad remainder
+        remaining = max_seq_len - len(current)
+        if remaining > 0:
+            current = current + _make_filler_tokens(tokenizer, remaining, rng)
+        elif remaining < 0:
+            current = current[:max_seq_len]
+
+        # Compute loss at each query's value positions
+        for value_start, value_end, pair_idx, kv_end in value_map:
+            if value_end > len(current):
+                continue
+            positions = list(range(value_start, value_end))
+            losses = _compute_loss_at_positions(model, current, positions, device)
+            if losses:
+                pair_trial_losses[pair_idx].append(float(np.mean(losses)))
+                pair_distances[pair_idx].append(value_start - kv_end)
+
+    # Summarize per pair
+    per_pair = {}
+    for idx in range(num_pairs):
+        if idx in pair_trial_losses and pair_trial_losses[idx]:
+            per_pair[idx] = {
+                "mean_loss_bits": float(np.mean(pair_trial_losses[idx])),
+                "std_loss_bits": float(np.std(pair_trial_losses[idx])),
+                "mean_distance_tokens": float(np.mean(pair_distances[idx])),
+                "n_valid": len(pair_trial_losses[idx]),
+            }
+
+    # Overall: mean across all pairs and trials
+    all_losses = [l for losses in pair_trial_losses.values() for l in losses]
+    overall = float(np.mean(all_losses)) if all_losses else float("nan")
+
+    return {
+        "task": "cross_boundary_ar",
+        "max_seq_len": max_seq_len,
+        "window_boundary": window_boundary,
+        "num_pairs": num_pairs,
+        "per_pair_results": {str(k): v for k, v in per_pair.items()},
+        "overall_mean_loss_bits": overall,
+    }

@@ -1,142 +1,133 @@
 # memory-bench
 
-Controlled benchmark of memory mechanisms for transformers, built on [nanochat](https://github.com/karpathy/nanochat).
+A controlled benchmark for memory mechanisms in transformers, built on [nanochat](https://github.com/karpathy/nanochat).
 
-Four memory mechanisms from recent papers, each plugged into the same nanochat 12-layer GPT. Same model, same data, same optimizer, same training steps. The only variable is the memory system.
+Four memory mechanisms from recent papers, each plugged into the same 12-layer GPT-2 variant. Same model, same data, same optimizer, same training budget. The only variable is the memory system. The goal is to measure what actually helps under fair conditions at small scale, and to understand where the comparison breaks down.
 
-## Results (2048 context, nanochat 286M, 4 seeds)
+## What this measures
 
-| Mechanism | s42 | s67 | s1337 | s3141 | Mean | vs Baseline |
-|-----------|-----|-----|-------|-------|------|-------------|
-| Baseline | 0.8467 | 0.8459 | 0.8458 | 0.8453 | 0.8459 | -- |
-| Persistent Memory (32 tok) | 0.8442 | 0.8446 | 0.8447 | 0.8433 | 0.8442 | **-0.0017** |
-| RMT (16 tok, seg=512, BPTT=2) | 0.8844 | 0.8839 | 0.8842 | 0.8885 | 0.8852 | +0.0393 |
-| TTT-Linear (chunk=64) | 0.8528 | 0.8507 | 0.8521 | 0.8524 | 0.8520 | +0.0061 |
-| Gated DeltaNet (layer 4) | 0.8472 | 0.8474 | 0.8477 | 0.8470 | 0.8473 | +0.0014 |
+Each mechanism is trained for 2,520 steps (~1.32B tokens) on FineWeb-Edu at 286M parameters. We evaluate bits-per-byte (BPB) across 2048, 4096, and 8192 token contexts using three attention conditions:
 
-### Statistical significance (paired t-tests, df=3)
+- **Local (SSSL)**: 3/4 layers use a short window (T/4), 1/4 use full context
+- **Global**: all layers use full context (upper bound on attention quality)
+- **Persistent Memory**: full causal attention with 32 learned KV pairs prepended per layer ([Sukhbaatar et al. 2019](https://arxiv.org/abs/1907.01470))
 
-| Mechanism | Mean ΔBPB | 95% CI | p-value | Cohen's d | Sig |
-|-----------|-----------|--------|---------|-----------|-----|
-| Persistent Memory | **-0.0017** | [-0.0027, -0.0007] | 0.012 | -2.72 | ** |
-| Gated DeltaNet | +0.0014 | [+0.0004, +0.0024] | 0.020 | 2.27 | ** |
-| TTT-Linear | +0.0061 | [+0.0046, +0.0076] | 0.001 | 6.53 | *** |
-| RMT | +0.0393 | [+0.0352, +0.0435] | <0.001 | 15.17 | *** |
+Note: Persistent Memory replaces the base attention module entirely rather than augmenting SSSL. This means the PM vs Global comparison isolates the contribution of learned memory tokens over full attention alone.
 
-All comparisons are statistically significant (p < 0.05). Significance: `***` p<0.01, `**` p<0.05.
+### Multi-context results (3 seeds per cell, paired by seed)
 
-**Bottom line:** At 2048 context, only Persistent Memory provides a statistically significant improvement over standard softmax attention.
+| Context | Local (SSSL) | Global (full attn) | Persistent Memory | PM vs Local | PM vs Global |
+|---------|-------------|-------------------|-------------------|-------------|-------------|
+| 2048 | 0.84599 | 0.84554 | 0.84420 | -1.79 mBPB | -1.34 mBPB |
+| 4096 | 0.84712 | 0.84654 | 0.84529 | -1.82 mBPB | -1.24 mBPB |
+| 8192 | 0.84932 | 0.84870 | 0.84763 | -1.69 mBPB | -1.07 mBPB |
 
-- **Persistent Memory** consistently beats baseline across all 4 seeds (p=0.012, Cohen's d=-2.72). Learned static KV pairs act as background context at 0.2% parameter overhead. The improvement grows at later positions in the context window.
-- **Gated DeltaNet** is close to softmax (+0.0014 BPB). Linear attention roughly matches quadratic attention at short context. At longer contexts, DeltaNet's O(n) scaling should provide a crossover point.
-- **TTT-Linear** is mildly negative (+0.0061 BPB). At 2048 tokens, the inner model cannot accumulate enough signal to overcome its overhead.
-- **RMT** is significantly hurt (+0.0393 BPB). Segment boundaries conflict with nanochat's sliding window attention -- tokens near boundaries lose access to local context that the baseline sees freely.
+### Mechanism comparison at T=2048 (4 seeds)
 
-This is consistent with the original papers. These mechanisms were designed for 8k-1M+ context where standard attention degrades. At 2048 tokens, softmax attention is already highly effective.
+| Mechanism | Mean BPB | vs Baseline | p-value (paired t) |
+|-----------|----------|-------------|---------------------|
+| Baseline (SSSL) | 0.8459 | -- | -- |
+| Persistent Memory | 0.8442 | -1.79 mBPB | 0.002 |
+| Gated DeltaNet | 0.8473 | +1.35 mBPB | 0.008 |
+| TTT-Linear | 0.8520 | +6.00 mBPB | <0.001 |
+| RMT | 0.8852 | +39.25 mBPB | <0.001 |
 
-### Figures
+Persistent Memory showed small but consistent improvements across all tested conditions. The other three mechanisms hurt performance in this setup. See [Limitations](#limitations-and-open-questions) for why "in this setup" matters.
 
 <p align="center">
-<img src="results/figures/bpb_comparison_4seed.png" width="600">
+<img src="results/figures/fig_three_condition.png" width="900">
 </p>
+<p align="center"><em>Position-resolved BPB at three context lengths.</em></p>
 
 <p align="center">
-<img src="results/figures/bpb_delta_zoomed_4seed.png" width="700">
+<img src="results/figures/fig_crossover.png" width="800">
 </p>
 
-### BPB by context position
+## Positional context deficit
 
-How does loss vary across the 2048-token sequence?
+The SSSL attention pattern creates a measurable positional context deficit: positions beyond the short-attention window boundary (T/4) show higher BPB under local attention than under global attention. This deficit grows with context length (0.53 mBPB at 2048, 0.59 at 4096, 1.38 at 8192).
 
-Each run produces a 32-bucket positional breakdown. Memory mechanisms should improve loss at later positions where accumulated context matters. All mechanisms show the expected curve shape (BPB drops from ~1.30 at the start to ~0.93 at position 2048), but the deltas between mechanisms are small at this context length.
+Persistent Memory closes more than the full deficit at 4096 and 8192 (closure ratio > 1.0), meaning it outperforms even global attention. One possible interpretation, following [Darcet et al. 2024](https://arxiv.org/abs/2309.16588), is that learned memory tokens act as a compressed information bottleneck. This is a hypothesis worth testing further, not a conclusion -- mBPB-scale effects on 3 seeds are suggestive, not definitive.
 
-Plots in `results/figures/`.
+<p align="center">
+<img src="results/figures/fig_deficit_map.png" width="900">
+</p>
 
 ## Design
 
-**Controlled comparison.** Same training loop, data, and training steps for every mechanism.
+**Plug-and-play framework.** Each mechanism is a `MemoryModule` subclass. Adding a new mechanism means writing one file and implementing `wrap_model()` + `extra_param_groups()`. No modifications to the GPT backbone.
 
-**Plug-and-play framework.** Each mechanism is a `MemoryModule` subclass. Adding a new mechanism means writing one file and implementing `wrap_model()` + `extra_param_groups()`. The training loop, evaluation, and statistics run automatically.
+**Position-resolved evaluation.** BPB is broken down into 64-token position buckets, enabling analysis of where in the context each mechanism helps or hurts.
 
-**BPB-by-position evaluation.** 32-bucket positional analysis showing where in the context each mechanism helps or hurts.
-
-**Test suite** covering mechanism wrapping, numerical correctness, optimizer surgery, regression baselines, seed reproducibility, and CLI plumbing.
-
-### Engineering notes
-
-- **DistMuonAdamW + mechanism replacement params:** When TTT/DeltaNet replace attention blocks, their new parameters become "orphan params" not in the optimizer. Adding these to Muon groups causes CUDA illegal memory access during Newton-Schulz iteration. The workaround is adding them as AdamW groups. This means replacement params get a slightly weaker optimizer, which slightly disadvantages TTT/DeltaNet in this comparison.
-
-- **DeltaNet + torch.compile:** FLA's Triton kernels are incompatible with torch.compile. Must use `--no-compile` for any mechanism using FLA.
-
-## Known limitations
-
-- **2048 context only.** The papers show benefits at 8k+ (TTT), multi-segment (RMT), or 100k+ (Infini-attention). Testing at 2048 confirms the negative result but doesn't test the regime where these mechanisms are designed to help. Extending to longer context is planned.
-
-- **Single model scale (286M).** The original papers test at 340M-1.3B. Our scale is comparable to the smallest configurations.
-
-- **Optimizer asymmetry.** TTT/DeltaNet replacement params use AdamW instead of Muon due to distributed optimizer constraints. This is a known conservative bias.
-
-- **RMT's segment boundaries break nanochat's sliding window pattern.** This likely explains RMT's poor performance and may not reflect RMT's potential on a simpler architecture.
+**Multi-seed, multi-context.** 4 seeds at T=2048, 3 seeds at T=4096 and T=8192. Paired by seed for within-subject comparisons. 42 total training runs.
 
 ## Experimental protocol
 
 | Setting | Value |
 |---------|-------|
-| Backbone | nanochat 12L, 768d, 6 heads, GQA, QK-norm, sliding window |
-| Vocab | 32,768 (rustbpe BPE) |
-| Data | ClimbMix-400B (101 shards, seed-shuffled; last shard = validation) |
-| Optimizer | Muon (body) + AdamW (embed/head/memory) |
-| Sequence length | 2048 |
-| Batch size | 524,288 tokens |
-| Training tokens | ~1.32B (2,520 steps) |
-| Hardware | 8xH100 80GB, DDP |
-| Metric | BPB (bits per byte) on held-out validation split |
-| Seeds | 42, 67, 1337, 3141 |
-| Time per run | ~13 minutes |
+| Architecture | nanochat 12L, 768d, 6 heads, GQA, QK-norm, RoPE (theta=100K) |
+| Parameters | 286M base, +0.2% overhead for memory mechanisms |
+| Attention | SSSL: 3 short-window layers (T/4) + 1 global layer, repeating |
+| Data | FineWeb-Edu (101 shards, seed-shuffled; last shard = validation) |
+| Optimizer | Muon (body) + AdamW (embed/head/memory params) |
+| Training tokens | ~1.32B per run (2,520 steps) |
+| Hardware | 8xH100 80GB SXM, DDP |
 
-Training shard order is deterministically shuffled per-seed (validation shard always last). This ensures each seed sees the same data in a different order, isolating the effect of initialization variance from data ordering.
+RoPE base frequency (100K) is inherited from nanochat and sufficient for all tested context lengths. Kept constant across conditions to avoid confounds.
+
+### Why nanochat at 286M?
+
+Each run takes 13-25 minutes. This enables 40+ runs with error bars on a single 8xH100 pod session, which matters more for a controlled comparison than running 2 seeds at 1.3B. The tradeoff is that results at this scale may not transfer to larger models.
+
+The design is deliberately structured around what Taleb calls [convex tinkering](https://en.wikipedia.org/wiki/Antifragile_(book)): many cheap experiments with bounded downside (a failed 15-minute run wastes little) and open-ended upside (an unexpected result at small scale motivates a targeted large-scale follow-up). Rather than committing a large compute budget to one or two configurations, we spread it across 42 runs covering multiple mechanisms, context lengths, and seeds. Most runs confirm the null. A few surface something worth investigating further. The positional deficit framework came out of this process -- it was not planned in advance, but emerged from looking at where in the sequence each mechanism helped or hurt.
 
 ## Mechanisms
 
-Each mechanism is a `MemoryModule` subclass in `memory_bench/mechanisms/`. One file per mechanism, no modifications to the GPT backbone.
+| Mechanism | Extra params | Approach | Reference |
+|-----------|-------------|----------|-----------|
+| Persistent Memory | 32 KV pairs/layer | Learned static tokens prepended to attention | [Sukhbaatar et al. 2019](https://arxiv.org/abs/1907.01470) |
+| RMT | 16 memory tokens | Segment recurrence with truncated BPTT | [Bulatov et al. 2022](https://arxiv.org/abs/2207.06881) |
+| TTT-Linear | Inner linear model | Per-token gradient descent on hidden state | [Sun et al. 2024](https://arxiv.org/abs/2407.04620) |
+| Gated DeltaNet | Delta rule state | Linear attention + gated write-erase-write | [Yang et al. 2025](https://arxiv.org/abs/2406.06484) |
 
-### Persistent Memory
-Learned KV pairs prepended to every attention layer. No positional encoding -- they act as static "background knowledge." Zero-init residual scale so the mechanism starts as identity.
-Ref: [Burtsev et al. 2020](https://arxiv.org/abs/2006.05055)
+## Limitations and open questions
 
-### Recurrent Memory Transformer (RMT)
-Input split into fixed segments. Memory tokens carry hidden states between segments. Truncated BPTT (depth=2) for gradient flow across segment boundaries.
-Ref: [Bulatov et al. 2022](https://arxiv.org/abs/2207.06881)
+These matter. The results above should be read with all of them in mind.
 
-### TTT-Linear (Test-Time Training)
-One transformer layer replaced with an inner linear model updated per-token via SGD. The "hidden state" is the model weights. Mini-batch dual form for chunk-parallel computation.
-Ref: [Sun et al. 2024](https://arxiv.org/abs/2407.04620)
+**Effect sizes are small.** The PM improvement is ~1.7 mBPB, or about 0.2% of the baseline BPB. This is statistically significant with paired tests but the practical significance is an open question. No downstream evaluation (few-shot, generation quality) has been run to check whether mBPB-scale BPB gains translate to capability differences.
 
-### Gated DeltaNet
-Softmax attention replaced with linear attention + delta rule. State matrix updated per-token via gated write-erase-write. Chunk-parallel training via FLA Triton kernels.
-Ref: [Yang et al. 2025](https://arxiv.org/abs/2406.06484)
+**Fixed budget may favor simple mechanisms.** All mechanisms train for the same 1.32B tokens. Persistent Memory adds 32 static KV pairs per layer -- almost nothing to learn. TTT-Linear has an inner optimization loop that must learn how to learn. Gated DeltaNet has recurrent state that takes time to train. A fixed budget inherently advantages the simplest mechanism. A fair follow-up would train TTT and DeltaNet for 5-10x longer tokens to check whether the gap closes.
+
+**TTT-Linear underperformance needs investigation.** The original paper shows clear gains at larger scale. At 286M with 1.32B tokens and AdamW (instead of Muon, which TTT replacement params can't use due to DDP constraints), the inner loop may not have enough signal to converge. This is an open question, not a verdict on TTT.
+
+**RMT is architecturally mismatched.** RMT's segment recurrence conflicts with SSSL's sliding window attention. Its +39 mBPB deficit likely reflects a harness incompatibility rather than a fundamental limitation. A fair RMT test would use a different base architecture.
+
+**Sample sizes at longer contexts are thin.** 3 seeds at 4096/8192 gives 2 degrees of freedom for paired t-tests. The direction is consistent across seeds but the confidence intervals are wide. The multi-context results are directionally suggestive, not definitive.
+
+**Single scale, single metric.** 286M parameters, BPB only. The original papers test at 340M-1.3B with multiple downstream tasks. Results here may not generalize to larger models or other evaluation criteria.
+
+**Optimizer asymmetry.** TTT and DeltaNet replacement parameters use AdamW instead of Muon due to distributed optimizer constraints. This is a known conservative bias against those mechanisms.
 
 ## Project structure
 
 ```
 memory_bench/
-├── mechanisms/
-│   ├── base.py          MemoryModule ABC
-│   ├── persistent.py    Persistent memory tokens (all layers)
-│   ├── rmt.py           RMT segment recurrence
-│   ├── ttt.py           TTT-Linear (dual-form, chunk-parallel)
-│   └── deltanet.py      Gated DeltaNet (via FLA)
-├── eval/
-│   ├── niah.py          Needle-in-a-haystack evaluation
-│   ├── synthetic.py     BPB-by-position analysis
-│   └── perplexity.py    BPB evaluation
-├── train.py             Distributed training (DDP, Muon+AdamW)
-├── bench.py             Result aggregation + statistics
-├── plot.py              Figure generation
-└── models.py            Config builder + param counting
-nanochat/                Git submodule (Karpathy's nanochat)
-tests/                   Test suite (10 files + conftest)
-run_experiments.sh       Full benchmark orchestration
+  mechanisms/
+    base.py          MemoryModule ABC
+    persistent.py    Persistent memory tokens
+    rmt.py           RMT segment recurrence
+    ttt.py           TTT-Linear (dual-form)
+    deltanet.py      Gated DeltaNet (via FLA)
+  eval/
+    niah.py          Needle-in-a-haystack evaluation
+    synthetic.py     BPB-by-position analysis
+    perplexity.py    BPB evaluation
+  train.py           Distributed training (DDP, Muon+AdamW)
+  models.py          Config builder + param counting
+analyze_results.py   Statistical analysis + figure generation
+nanochat/            Git submodule (Karpathy's nanochat)
+tests/               Test suite across 12 files
+results/             JSON results + figures + auto-generated report
 ```
 
 ## Usage
@@ -146,46 +137,28 @@ git clone --recursive https://github.com/Robby955/memory-bench.git
 cd memory-bench
 
 # Install dependencies
-pip install torch fla-core rustbpe tokenizers sentencepiece matplotlib wandb
+pip install torch fla-core rustbpe tokenizers sentencepiece matplotlib scipy
 
-# Download data + train tokenizer (first time only)
+# Download data + train tokenizer
 NANOCHAT_BASE_DIR=/path/to/cache python -m nanochat.dataset -n 100
 NANOCHAT_BASE_DIR=/path/to/cache python -m scripts.tok_train
 
-# Single run
+# Single run (~13 min on 8xH100)
 torchrun --standalone --nproc_per_node=8 -m memory_bench.train \
-    --depth=12 --mechanism=none --seed=42
+    --depth=12 --mechanism=persistent --seed=42 --max-seq-len=4096
 
-# Full benchmark: 5 mechanisms x 4 seeds
+# Full benchmark (~10 hours on 8xH100)
 bash run_experiments.sh
-```
 
-Results save to `results/` as JSON. Each JSON includes full training metadata, BPB-by-position breakdown, and timing.
+# Analysis + figures
+python analyze_results.py
+```
 
 ## Tests
 
 ```bash
-pip install pytest
 pytest tests/ -v
 ```
-
-Covers: mechanism wrapping, numerical correctness, optimizer surgery, regression baselines, BPB evaluation, CLI plumbing, seed reproducibility.
-
-## Contributing
-
-The framework is designed to make adding new mechanisms easy. To add a mechanism:
-
-1. Create a file in `memory_bench/mechanisms/` (see `persistent.py` for the simplest example)
-2. Subclass `MemoryModule` and implement `wrap_model()` + `extra_param_groups()`
-3. Register it in `memory_bench/mechanisms/__init__.py`
-4. Run: `torchrun --standalone --nproc_per_node=8 -m memory_bench.train --mechanism=your_mechanism --seed=42`
-
-Mechanisms we'd like to see benchmarked: Mamba2, RWKV-7, Infini-attention, Based, HGRN2. PRs welcome.
-
-Other directions:
-- Extend to 8192+ context where papers show real separation between mechanisms
-- Multi-scale comparison (12L/24L)
-- NIAH evaluation at extended context
 
 ## License
 

@@ -77,7 +77,7 @@ def init_with_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    config = GPTConfig(vocab_size=8192, n_layer=4, n_head=4, n_embd=128, sequence_len=256)
+    config = GPTConfig(vocab_size=8192, n_layer=4, n_head=4, n_kv_head=4, n_embd=128, sequence_len=256)
     with torch.device('meta'):
         m = GPT(config)
     m.to_empty(device='cpu')
@@ -130,10 +130,103 @@ fi
 pkill -9 -f "memory_bench.train" 2>/dev/null || true
 sleep 3
 
+# 9. Multi-context smoke test (4096, 5 steps, verify batch size math)
+echo "9. Multi-context smoke test (4096, 5 steps, dbs=16)"
+if timeout 120 python -m torch.distributed.run \
+    --standalone --nproc_per_node=1 \
+    -m memory_bench.train \
+    --depth=4 --mechanism=none --seed=42 \
+    --max-seq-len=4096 --device-batch-size=16 --total-batch-size=524288 \
+    --num-iterations=5 --eval-every=999 \
+    --exp-tag=preflight_4096 2>&1 | tail -3; then
+    pass "4096 context baseline runs (dbs=16)"
+else
+    fail "4096 context baseline crashed (batch size or VRAM issue)"
+fi
+pkill -9 -f "memory_bench.train" 2>/dev/null || true
+sleep 3
+
+# 10. Multi-context smoke test (8192, 5 steps, verify VRAM fits)
+echo "10. Multi-context smoke test (8192, 5 steps, dbs=8)"
+if timeout 180 python -m torch.distributed.run \
+    --standalone --nproc_per_node=1 \
+    -m memory_bench.train \
+    --depth=4 --mechanism=none --seed=42 \
+    --max-seq-len=8192 --device-batch-size=8 --total-batch-size=524288 \
+    --num-iterations=5 --eval-every=999 \
+    --exp-tag=preflight_8192 2>&1 | tail -3; then
+    pass "8192 context baseline runs (dbs=8)"
+else
+    fail "8192 context baseline crashed (likely OOM — check VRAM)"
+fi
+pkill -9 -f "memory_bench.train" 2>/dev/null || true
+sleep 3
+
+# 11. Global attention smoke test (Direction B: window-pattern L)
+echo "11. Global attention smoke test (2048, 5 steps, window=L)"
+if timeout 120 python -m torch.distributed.run \
+    --standalone --nproc_per_node=1 \
+    -m memory_bench.train \
+    --depth=4 --mechanism=none --seed=42 \
+    --max-seq-len=2048 --window-pattern=L \
+    --num-iterations=5 --eval-every=999 \
+    --exp-tag=preflight_global 2>&1 | tail -3; then
+    pass "Global attention (window=L) baseline runs"
+else
+    fail "Global attention baseline crashed (check --window-pattern=L support)"
+fi
+pkill -9 -f "memory_bench.train" 2>/dev/null || true
+sleep 3
+
+# 12. Global attention at 8192 (verify VRAM with full attention)
+echo "12. Global attention 8192 smoke test (5 steps, window=L, dbs=4)"
+if timeout 180 python -m torch.distributed.run \
+    --standalone --nproc_per_node=1 \
+    -m memory_bench.train \
+    --depth=4 --mechanism=none --seed=42 \
+    --max-seq-len=8192 --device-batch-size=4 --total-batch-size=524288 \
+    --window-pattern=L \
+    --num-iterations=5 --eval-every=999 \
+    --exp-tag=preflight_global_8192 2>&1 | tail -3; then
+    pass "Global attention 8192 runs (dbs=4)"
+else
+    fail "Global attention 8192 crashed (likely OOM — full attention at 8192 needs smaller batch)"
+fi
+pkill -9 -f "memory_bench.train" 2>/dev/null || true
+sleep 3
+
+# 13. Result filename format check (multi-context + window pattern)
+echo "13. Result filename format"
+PREFLIGHT_RESULT="results/baseline_d4_t4096_s42.json"
+PREFLIGHT_GLOBAL="results/baseline_d4_t2048_wL_s42.json"
+FORMAT_OK=0
+for f in "$PREFLIGHT_RESULT" "$PREFLIGHT_GLOBAL"; do
+    if [[ -f "$f" ]]; then
+        HAS_FIELDS=$(python3 -c "
+import json; d=json.load(open('$f'))
+ok = 'max_seq_len' in d and 'window_pattern' in d
+print('yes' if ok else 'no')
+")
+        if [[ "$HAS_FIELDS" == "yes" ]]; then
+            FORMAT_OK=1
+        fi
+    fi
+done
+if [[ $FORMAT_OK -eq 1 ]]; then
+    pass "Result JSON includes max_seq_len and window_pattern fields"
+else
+    warn "Preflight result files not found (non-fatal if first run)"
+fi
+
+# Cleanup preflight artifacts
+rm -f results/baseline_d4_t*_s42.json results/baseline_d4_t*_wL_s42.json 2>/dev/null
+rm -f results/baseline_d4_s42.json 2>/dev/null
+rm -f results/checkpoints/baseline_d4_t*.pt results/checkpoints/baseline_d4_s42.pt 2>/dev/null
+
 echo ""
 echo "============================================================"
 if [[ $FAIL -eq 0 ]]; then
-    echo "  ALL CHECKS PASSED — ready for: bash run_experiments.sh"
+    echo "  ALL CHECKS PASSED — ready for: bash run_multicontext.sh"
 else
     echo "  $FAIL CHECK(S) FAILED — fix before running experiments"
 fi

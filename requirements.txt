@@ -1,8 +1,11 @@
-torch>=2.5.0
-fla-core>=0.4.0
-rustbpe
-tokenizers
-sentencepiece
-matplotlib
-numpy
-scipy
+# Pinned for reproducibility. See also: nanochat/pyproject.toml
+# Record actual installed versions with: pip freeze > results/environment/pip_freeze.txt
+torch==2.9.1
+fla-core==0.4.2
+rustbpe>=0.1.0
+tokenizers>=0.22.0
+sentencepiece>=0.2.0
+matplotlib>=3.9.0
+numpy>=1.26.0
+scipy>=1.12.0
+wandb>=0.21.0

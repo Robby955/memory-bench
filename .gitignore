@@ -5,8 +5,9 @@ dist/
 build/
 .eggs/
 *.so
-results/*.csv
 wandb/
 .venv/
 *.pt
 *.bin
+results/checkpoints/
+results/logs/

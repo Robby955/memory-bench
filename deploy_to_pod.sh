@@ -55,7 +55,8 @@ eval $RSYNC \
 echo "Installing memory-bench on pod..."
 $SSH << 'INSTALL'
 cd /workspace/memory-bench
-pip install -e ".[gpu]" 2>&1 | tail -5
+pip install --break-system-packages -e ".[gpu]" 2>&1 | tail -5
+pip install --break-system-packages tokenizers sentencepiece rustbpe datasets tiktoken 2>&1 | tail -3
 # Verify imports work
 python -c "
 import memory_bench
@@ -66,7 +67,26 @@ print('nanochat imports OK')
 "
 INSTALL
 
+# Set up git on pod for result saving
+echo "Setting up git for result saving..."
+$SSH << 'GITSETUP'
+cd /workspace/memory-bench
+git init 2>/dev/null || true
+git config user.name "Robby Sneiderman"
+git config user.email "robbysneiderman@gmail.com"
+# Add dev repo as remote if not already set
+if ! git remote get-url origin >/dev/null 2>&1; then
+    git remote add origin https://github.com/Robby955/memory-bench-dev.git
+fi
+echo "Git configured. Remote: $(git remote get-url origin)"
+GITSETUP
+
 echo ""
 echo "=== Deploy complete ==="
-echo "Run experiments with: ssh $POD_HOST -p $POD_PORT"
-echo "  cd /workspace/memory-bench && bash run_experiments.sh"
+echo ""
+echo "IMPORTANT: For automatic result saving, set up git auth on the pod:"
+echo "  ssh $POD_HOST -p $POD_PORT"
+echo "  gh auth login   # or set GITHUB_TOKEN"
+echo ""
+echo "Run experiments with:"
+echo "  cd /workspace/memory-bench && bash run_multicontext.sh"
